@@ -1,0 +1,80 @@
+# Certificate files - NEVER commit private keys or certificates
+*.key
+*.crt
+*.csr
+*.pem
+*.p12
+*.pfx
+*.jks
+*.der
+
+# Certificate directories
+/tmp/
+/certs/
+/keys/
+/ocp-certs/
+
+# Sensitive inventory files (use .example files instead)
+/inventories/inventory.yml
+/inventories/inventory.ini
+/inventories/**/hosts
+!/inventories/**/*-example.*
+
+# Ansible
+*.retry
+.ansible/
+ansible.log
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Secrets
+**/secrets/
+**/*secret*
+**/*password*
+**/*token*
+
+# Kerberos
+krb5.conf
+krb5cc_*
+*.keytab
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+*.orig
+
+# Generated scripts
+**/deploy-*.sh
+**/renew-*.sh
+**/setup-*.sh
+**/*-summary.txt
+
+# Test outputs
+test-results/
+coverage/

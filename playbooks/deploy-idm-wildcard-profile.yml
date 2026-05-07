@@ -1,0 +1,209 @@
+---
+- name: Deploy Red Hat IdM Wildcard Certificate Profile for OpenShift
+  hosts: ipaserver
+  become: true
+  vars:
+    ipa_admin_password: "{{ lookup('env', 'IPA_ADMIN_PASSWORD') }}"
+    profile_name: caOCPWildcardCert
+    profile_description: "OpenShift Wildcard Certificate Profile"
+    profile_file: idm-wildcard-cert-profile.cfg
+    caacl_name: ocp_wildcard_certs
+    ocp_domain: ocp.example.com
+    ocp_apps_domain: apps.{{ ocp_domain }}
+    ocp_api_hostname: api.{{ ocp_domain }}
+    ocp_service_principal: "HTTP/{{ ocp_api_hostname }}"
+
+  tasks:
+    - name: Ensure IPA admin credentials are available
+      ansible.builtin.fail:
+        msg: "IPA_ADMIN_PASSWORD environment variable must be set"
+      when: ipa_admin_password | length == 0
+
+    - name: Install required packages
+      ansible.builtin.dnf:
+        name:
+          - ipa-server
+          - python3-ipalib
+          - python3-ipaclient
+        state: present
+
+    - name: Copy certificate profile configuration
+      ansible.builtin.copy:
+        src: "../{{ profile_file }}"
+        dest: "/tmp/{{ profile_file }}"
+        mode: '0644'
+      register: profile_copied
+
+    - name: Obtain Kerberos ticket for admin
+      ansible.builtin.shell: |
+        echo "{{ ipa_admin_password }}" | kinit admin
+      no_log: true
+      changed_when: false
+
+    - name: Check if certificate profile already exists
+      ansible.builtin.command: ipa certprofile-show {{ profile_name }}
+      register: profile_exists
+      changed_when: false
+      failed_when: false
+
+    - name: Import certificate profile
+      ansible.builtin.command: >
+        ipa certprofile-import {{ profile_name }}
+        --file=/tmp/{{ profile_file }}
+        --desc="{{ profile_description }}"
+        --store=true
+      when: profile_exists.rc != 0
+      register: profile_imported
+
+    - name: Display profile import result
+      ansible.builtin.debug:
+        msg: "Certificate profile '{{ profile_name }}' imported successfully"
+      when: profile_imported is changed
+
+    - name: Check if CA ACL exists
+      ansible.builtin.command: ipa caacl-show {{ caacl_name }}
+      register: caacl_exists
+      changed_when: false
+      failed_when: false
+
+    - name: Create CA ACL for OpenShift wildcard certificates
+      ansible.builtin.command: >
+        ipa caacl-add {{ caacl_name }}
+        --desc="ACL for OpenShift wildcard certificates"
+      when: caacl_exists.rc != 0
+      register: caacl_created
+
+    - name: Add certificate profile to CA ACL
+      ansible.builtin.command: >
+        ipa caacl-add-profile {{ caacl_name }}
+        --certprofile={{ profile_name }}
+      when: caacl_created is changed
+      register: profile_added_to_acl
+      failed_when:
+        - profile_added_to_acl.rc != 0
+        - "'already contains' not in profile_added_to_acl.stderr"
+
+    - name: Check if OpenShift service principal exists
+      ansible.builtin.command: ipa service-show {{ ocp_service_principal }}
+      register: service_exists
+      changed_when: false
+      failed_when: false
+
+    - name: Create OpenShift service principal
+      ansible.builtin.command: >
+        ipa service-add {{ ocp_service_principal }}
+      when: service_exists.rc != 0
+      register: service_created
+
+    - name: Add service to CA ACL
+      ansible.builtin.command: >
+        ipa caacl-add-service {{ caacl_name }}
+        --services={{ ocp_service_principal }}
+      when: service_created is changed or service_exists.rc == 0
+      register: service_added_to_acl
+      failed_when:
+        - service_added_to_acl.rc != 0
+        - "'already contains' not in service_added_to_acl.stderr"
+
+    - name: Add IPA CA to CA ACL
+      ansible.builtin.command: >
+        ipa caacl-add-ca {{ caacl_name }}
+        --cas=ipa
+      register: ca_added_to_acl
+      failed_when:
+        - ca_added_to_acl.rc != 0
+        - "'already contains' not in ca_added_to_acl.stderr"
+      changed_when: "'already contains' not in ca_added_to_acl.stderr"
+
+    - name: Enable CA ACL
+      ansible.builtin.command: ipa caacl-enable {{ caacl_name }}
+      register: caacl_enabled
+      failed_when:
+        - caacl_enabled.rc != 0
+        - "'already enabled' not in caacl_enabled.stderr"
+      changed_when: "'already enabled' not in caacl_enabled.stderr"
+
+    - name: Verify certificate profile setup
+      ansible.builtin.command: ipa certprofile-show {{ profile_name }}
+      register: profile_verify
+      changed_when: false
+
+    - name: Display profile details
+      ansible.builtin.debug:
+        var: profile_verify.stdout_lines
+
+    - name: Verify CA ACL setup
+      ansible.builtin.command: ipa caacl-show {{ caacl_name }}
+      register: caacl_verify
+      changed_when: false
+
+    - name: Display CA ACL details
+      ansible.builtin.debug:
+        var: caacl_verify.stdout_lines
+
+    - name: Create summary file
+      ansible.builtin.copy:
+        dest: "/root/idm-wildcard-profile-summary.txt"
+        mode: '0600'
+        content: |
+          Red Hat IdM Wildcard Certificate Profile Deployment Summary
+          ============================================================
+
+          Deployment Date: {{ ansible_date_time.iso8601 }}
+          Profile Name: {{ profile_name }}
+          CA ACL Name: {{ caacl_name }}
+          Service Principal: {{ ocp_service_principal }}
+
+          OpenShift Configuration:
+          - Domain: {{ ocp_domain }}
+          - Apps Domain: {{ ocp_apps_domain }}
+          - API Hostname: {{ ocp_api_hostname }}
+
+          Next Steps:
+          -----------
+          1. Request a wildcard certificate:
+
+             ipa cert-request wildcard-ocp.csr \
+               --principal={{ ocp_service_principal }} \
+               --profile-id={{ profile_name }} \
+               --certificate-out=wildcard-ocp.crt
+
+          2. Or use certmonger for auto-renewal:
+
+             ipa-getcert request \
+               -f /etc/pki/tls/certs/wildcard-ocp.crt \
+               -k /etc/pki/tls/private/wildcard-ocp.key \
+               -K {{ ocp_service_principal }} \
+               -D *.{{ ocp_apps_domain }} \
+               -D {{ ocp_api_hostname }} \
+               -T {{ profile_name }}
+
+          3. Configure OpenShift ingress controller with the certificate
+
+          Profile Status: {{ 'Imported' if profile_imported is changed else 'Already exists' }}
+          CA ACL Status: {{ 'Created' if caacl_created is changed else 'Already exists' }}
+          Service Principal Status: {{ 'Created' if service_created is changed else 'Already exists' }}
+
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - "IdM Wildcard Certificate Profile Deployed"
+          - "========================================="
+          - "Profile: {{ profile_name }}"
+          - "CA ACL: {{ caacl_name }}"
+          - "Service: {{ ocp_service_principal }}"
+          - ""
+          - "Summary saved to: /root/idm-wildcard-profile-summary.txt"
+          - "========================================="
+
+    - name: Destroy Kerberos ticket
+      ansible.builtin.command: kdestroy
+      changed_when: false
+      failed_when: false
+
+  handlers:
+    - name: Restart IPA services
+      ansible.builtin.service:
+        name: ipa
+        state: restarted

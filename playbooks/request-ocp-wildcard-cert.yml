@@ -1,0 +1,413 @@
+---
+- name: Request OpenShift Wildcard Certificate from Red Hat IdM
+  hosts: localhost
+  gather_facts: true
+  vars:
+    ipa_admin_password: "{{ lookup('env', 'IPA_ADMIN_PASSWORD') }}"
+    ipa_server: ipa.example.com
+    profile_name: caOCPWildcardCert
+    ocp_domain: ocp.example.com
+    ocp_apps_domain: apps.{{ ocp_domain }}
+    ocp_api_hostname: api.{{ ocp_domain }}
+    ocp_api_internal_hostname: api-int.{{ ocp_domain }}
+    service_principal: "HTTP/{{ ocp_api_hostname }}"
+    cert_base_path: /tmp/ocp-certs
+    wildcard_cn: "*.{{ ocp_apps_domain }}"
+    key_size: 2048
+    cert_validity_days: 365
+    organization: "Example Organization"
+    organizational_unit: "OpenShift Platform"
+    country: US
+    state: "North Carolina"
+    locality: "Raleigh"
+
+  tasks:
+    - name: Ensure IPA admin password is set
+      ansible.builtin.fail:
+        msg: "IPA_ADMIN_PASSWORD environment variable must be set"
+      when: ipa_admin_password | length == 0
+
+    - name: Create certificate directory
+      ansible.builtin.file:
+        path: "{{ cert_base_path }}"
+        state: directory
+        mode: '0700'
+
+    - name: Install required packages
+      ansible.builtin.dnf:
+        name:
+          - openssl
+          - python3-ipalib
+          - ipa-client
+          - certmonger
+        state: present
+      become: true
+
+    - name: Obtain Kerberos ticket
+      ansible.builtin.shell: |
+        echo "{{ ipa_admin_password }}" | kinit admin
+      no_log: true
+      changed_when: false
+
+    - name: Create OpenSSL configuration for wildcard certificate
+      ansible.builtin.copy:
+        dest: "{{ cert_base_path }}/wildcard-ocp.conf"
+        mode: '0644'
+        content: |
+          [req]
+          distinguished_name = req_distinguished_name
+          req_extensions = v3_req
+          prompt = no
+
+          [req_distinguished_name]
+          CN = {{ wildcard_cn }}
+          O = {{ organization }}
+          OU = {{ organizational_unit }}
+          C = {{ country }}
+          ST = {{ state }}
+          L = {{ locality }}
+
+          [v3_req]
+          keyUsage = digitalSignature, keyEncipherment
+          extendedKeyUsage = serverAuth, clientAuth
+          subjectAltName = @alt_names
+
+          [alt_names]
+          DNS.1 = {{ wildcard_cn }}
+          DNS.2 = {{ ocp_api_hostname }}
+          DNS.3 = {{ ocp_api_internal_hostname }}
+          DNS.4 = *.{{ ocp_domain }}
+
+    - name: Generate private key
+      ansible.builtin.command: >
+        openssl genrsa
+        -out {{ cert_base_path }}/wildcard-ocp.key
+        {{ key_size }}
+      args:
+        creates: "{{ cert_base_path }}/wildcard-ocp.key"
+
+    - name: Set private key permissions
+      ansible.builtin.file:
+        path: "{{ cert_base_path }}/wildcard-ocp.key"
+        mode: '0600'
+
+    - name: Generate Certificate Signing Request (CSR)
+      ansible.builtin.command: >
+        openssl req -new
+        -key {{ cert_base_path }}/wildcard-ocp.key
+        -out {{ cert_base_path }}/wildcard-ocp.csr
+        -config {{ cert_base_path }}/wildcard-ocp.conf
+      args:
+        creates: "{{ cert_base_path }}/wildcard-ocp.csr"
+
+    - name: Display CSR details
+      ansible.builtin.command: >
+        openssl req -text -noout
+        -in {{ cert_base_path }}/wildcard-ocp.csr
+      register: csr_details
+      changed_when: false
+
+    - name: Show CSR information
+      ansible.builtin.debug:
+        var: csr_details.stdout_lines
+
+    - name: Check if service principal exists
+      ansible.builtin.command: ipa service-show {{ service_principal }}
+      register: service_check
+      changed_when: false
+      failed_when: false
+
+    - name: Create service principal if needed
+      ansible.builtin.command: ipa service-add {{ service_principal }}
+      when: service_check.rc != 0
+
+    - name: Request certificate from IdM
+      ansible.builtin.shell: |
+        ipa cert-request {{ cert_base_path }}/wildcard-ocp.csr \
+          --principal={{ service_principal }} \
+          --profile-id={{ profile_name }} \
+          --certificate-out={{ cert_base_path }}/wildcard-ocp.crt
+      register: cert_request
+      failed_when: cert_request.rc != 0
+
+    - name: Display certificate request result
+      ansible.builtin.debug:
+        var: cert_request.stdout_lines
+
+    - name: Extract certificate serial number
+      ansible.builtin.shell: |
+        openssl x509 -in {{ cert_base_path }}/wildcard-ocp.crt -noout -serial | cut -d= -f2
+      register: cert_serial
+      changed_when: false
+
+    - name: Download IPA CA certificate
+      ansible.builtin.get_url:
+        url: "http://{{ ipa_server }}/ipa/config/ca.crt"
+        dest: "{{ cert_base_path }}/ipa-ca.crt"
+        mode: '0644'
+
+    - name: Convert CA certificate to PEM
+      ansible.builtin.command: >
+        openssl x509
+        -in {{ cert_base_path }}/ipa-ca.crt
+        -out {{ cert_base_path }}/ipa-ca.pem
+      args:
+        creates: "{{ cert_base_path }}/ipa-ca.pem"
+
+    - name: Create certificate bundle (cert + CA chain)
+      ansible.builtin.shell: |
+        cat {{ cert_base_path }}/wildcard-ocp.crt \
+            {{ cert_base_path }}/ipa-ca.pem \
+            > {{ cert_base_path }}/wildcard-bundle.pem
+      args:
+        creates: "{{ cert_base_path }}/wildcard-bundle.pem"
+
+    - name: Verify certificate
+      ansible.builtin.command: >
+        openssl x509 -text -noout
+        -in {{ cert_base_path }}/wildcard-ocp.crt
+      register: cert_details
+      changed_when: false
+
+    - name: Display certificate details
+      ansible.builtin.debug:
+        var: cert_details.stdout_lines
+
+    - name: Verify certificate chain
+      ansible.builtin.command: >
+        openssl verify
+        -CAfile {{ cert_base_path }}/ipa-ca.pem
+        {{ cert_base_path }}/wildcard-ocp.crt
+      register: cert_verify
+      changed_when: false
+
+    - name: Display verification result
+      ansible.builtin.debug:
+        var: cert_verify.stdout
+
+    - name: Create OpenShift deployment script
+      ansible.builtin.copy:
+        dest: "{{ cert_base_path }}/deploy-to-openshift.sh"
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # OpenShift Wildcard Certificate Deployment Script
+          # Generated: {{ ansible_date_time.iso8601 }}
+
+          set -e
+
+          CERT_DIR="{{ cert_base_path }}"
+          NAMESPACE_INGRESS="openshift-ingress"
+          NAMESPACE_CONFIG="openshift-config"
+          SECRET_NAME="router-wildcard-cert"
+
+          echo "Deploying wildcard certificate to OpenShift..."
+
+          # Check if oc is available
+          if ! command -v oc &> /dev/null; then
+              echo "Error: oc command not found. Please install OpenShift CLI."
+              exit 1
+          fi
+
+          # Check if logged in
+          if ! oc whoami &> /dev/null; then
+              echo "Error: Not logged in to OpenShift. Run 'oc login' first."
+              exit 1
+          fi
+
+          # Create secret in openshift-ingress namespace
+          echo "Creating TLS secret..."
+          oc create secret tls ${SECRET_NAME} \
+              --cert=${CERT_DIR}/wildcard-bundle.pem \
+              --key=${CERT_DIR}/wildcard-ocp.key \
+              -n ${NAMESPACE_INGRESS} \
+              --dry-run=client -o yaml | oc apply -f -
+
+          # Patch the default IngressController
+          echo "Updating IngressController..."
+          oc patch ingresscontroller default \
+              -n openshift-ingress-operator \
+              --type=merge \
+              --patch="{\"spec\":{\"defaultCertificate\":{\"name\":\"${SECRET_NAME}\"}}}"
+
+          echo ""
+          echo "Certificate deployed successfully!"
+          echo ""
+          echo "Certificate Details:"
+          echo "  Serial: {{ cert_serial.stdout }}"
+          echo "  Subject: {{ wildcard_cn }}"
+          echo "  SANs:"
+          echo "    - {{ wildcard_cn }}"
+          echo "    - {{ ocp_api_hostname }}"
+          echo "    - {{ ocp_api_internal_hostname }}"
+          echo "    - *.{{ ocp_domain }}"
+          echo ""
+          echo "Monitor router pods restart:"
+          echo "  oc get pods -n ${NAMESPACE_INGRESS} -w"
+          echo ""
+          echo "Verify certificate:"
+          echo "  echo | openssl s_client -connect {{ ocp_apps_domain }}:443 -servername test.{{ ocp_apps_domain }} 2>/dev/null | openssl x509 -noout -text"
+
+    - name: Create certificate renewal script for certmonger
+      ansible.builtin.copy:
+        dest: "{{ cert_base_path }}/setup-certmonger-renewal.sh"
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # Setup certmonger for automatic certificate renewal
+          # Generated: {{ ansible_date_time.iso8601 }}
+
+          set -e
+
+          CERT_PATH="/etc/pki/tls/certs/wildcard-ocp.crt"
+          KEY_PATH="/etc/pki/tls/private/wildcard-ocp.key"
+
+          echo "Setting up certmonger for automatic renewal..."
+
+          # Install certificate and key to standard locations
+          sudo cp {{ cert_base_path }}/wildcard-ocp.crt ${CERT_PATH}
+          sudo cp {{ cert_base_path }}/wildcard-ocp.key ${KEY_PATH}
+          sudo chmod 644 ${CERT_PATH}
+          sudo chmod 600 ${KEY_PATH}
+
+          # Add certmonger tracking
+          sudo ipa-getcert start-tracking \
+              -f ${CERT_PATH} \
+              -k ${KEY_PATH} \
+              -K {{ service_principal }} \
+              -T {{ profile_name }}
+
+          # Or request new certificate with auto-renewal
+          # sudo ipa-getcert request \
+          #   -f ${CERT_PATH} \
+          #   -k ${KEY_PATH} \
+          #   -K {{ service_principal }} \
+          #   -D {{ wildcard_cn }} \
+          #   -D {{ ocp_api_hostname }} \
+          #   -D {{ ocp_api_internal_hostname }} \
+          #   -D *.{{ ocp_domain }} \
+          #   -T {{ profile_name }} \
+          #   -C "{{ cert_base_path }}/renew-hook.sh"
+
+          echo "Certmonger tracking enabled!"
+          echo ""
+          echo "Check status:"
+          echo "  sudo getcert list -f ${CERT_PATH}"
+
+    - name: Create renewal hook script
+      ansible.builtin.copy:
+        dest: "{{ cert_base_path }}/renew-hook.sh"
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # Certificate renewal hook - updates OpenShift secret
+          # Generated: {{ ansible_date_time.iso8601 }}
+
+          CERT_PATH="/etc/pki/tls/certs/wildcard-ocp.crt"
+          KEY_PATH="/etc/pki/tls/private/wildcard-ocp.key"
+          CA_PATH="{{ cert_base_path }}/ipa-ca.pem"
+          BUNDLE_PATH="{{ cert_base_path }}/wildcard-bundle-renewed.pem"
+          SECRET_NAME="router-wildcard-cert"
+          NAMESPACE="openshift-ingress"
+
+          # Create bundle
+          cat ${CERT_PATH} ${CA_PATH} > ${BUNDLE_PATH}
+
+          # Update OpenShift secret
+          oc create secret tls ${SECRET_NAME} \
+              --cert=${BUNDLE_PATH} \
+              --key=${KEY_PATH} \
+              -n ${NAMESPACE} \
+              --dry-run=client -o yaml | oc apply -f -
+
+          # Trigger router restart
+          oc delete pods -n ${NAMESPACE} -l router=router-default
+
+          logger "OpenShift wildcard certificate renewed and deployed"
+
+    - name: Create certificate summary
+      ansible.builtin.copy:
+        dest: "{{ cert_base_path }}/certificate-summary.txt"
+        mode: '0644'
+        content: |
+          OpenShift Wildcard Certificate Summary
+          =======================================
+
+          Generation Date: {{ ansible_date_time.iso8601 }}
+          Certificate Serial: {{ cert_serial.stdout }}
+
+          Certificate Details:
+          -------------------
+          Common Name: {{ wildcard_cn }}
+          Organization: {{ organization }}
+          Organizational Unit: {{ organizational_unit }}
+          Country: {{ country }}
+          State: {{ state }}
+          Locality: {{ locality }}
+
+          Subject Alternative Names:
+          -------------------------
+          - {{ wildcard_cn }}
+          - {{ ocp_api_hostname }}
+          - {{ ocp_api_internal_hostname }}
+          - *.{{ ocp_domain }}
+
+          Files Generated:
+          ---------------
+          Private Key:        {{ cert_base_path }}/wildcard-ocp.key
+          Certificate:        {{ cert_base_path }}/wildcard-ocp.crt
+          CSR:                {{ cert_base_path }}/wildcard-ocp.csr
+          CA Certificate:     {{ cert_base_path }}/ipa-ca.pem
+          Certificate Bundle: {{ cert_base_path }}/wildcard-bundle.pem
+
+          IdM Details:
+          -----------
+          Profile: {{ profile_name }}
+          Service Principal: {{ service_principal }}
+          IPA Server: {{ ipa_server }}
+
+          Next Steps:
+          ----------
+          1. Deploy to OpenShift:
+             {{ cert_base_path }}/deploy-to-openshift.sh
+
+          2. Setup automatic renewal:
+             {{ cert_base_path }}/setup-certmonger-renewal.sh
+
+          3. Verify deployment:
+             oc get ingresscontroller default -n openshift-ingress-operator -o yaml
+
+          4. Test certificate:
+             curl -v https://test.{{ ocp_apps_domain }}
+
+          Security Notes:
+          --------------
+          - Private key is stored in {{ cert_base_path }}/wildcard-ocp.key (mode 0600)
+          - Backup the private key securely before deploying to production
+          - Consider using HSM or KMS for production private key storage
+          - Certificate will expire in {{ cert_validity_days }} days
+          - Setup certmonger for automatic renewal before expiration
+
+    - name: Display completion summary
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - "OpenShift Wildcard Certificate Generated"
+          - "========================================="
+          - "Certificate Serial: {{ cert_serial.stdout }}"
+          - "Common Name: {{ wildcard_cn }}"
+          - "Certificate Path: {{ cert_base_path }}/wildcard-ocp.crt"
+          - "Private Key Path: {{ cert_base_path }}/wildcard-ocp.key"
+          - "Bundle Path: {{ cert_base_path }}/wildcard-bundle.pem"
+          - ""
+          - "Next Steps:"
+          - "1. Deploy to OpenShift: {{ cert_base_path }}/deploy-to-openshift.sh"
+          - "2. Setup renewal: {{ cert_base_path }}/setup-certmonger-renewal.sh"
+          - ""
+          - "Summary: {{ cert_base_path }}/certificate-summary.txt"
+          - "========================================="
+
+    - name: Destroy Kerberos ticket
+      ansible.builtin.command: kdestroy
+      changed_when: false
+      failed_when: false
